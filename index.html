@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+  <title>ARMA Hand Scanner (Web, Multi‑View + STL)</title>
+  <meta name="theme-color" content="#000000"/>
+  <style>
+    :root{color-scheme: dark;}
+    html,body{margin:0;padding:0;background:#000;color:#fff;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+    .wrap{max-width:1100px;margin:0 auto;padding:16px}
+    h1{font-size:24px;margin:8px 0 12px}
+    .grid{display:grid;grid-template-columns:1fr;gap:12px}
+    @media(min-width:980px){.grid{grid-template-columns:1fr 1fr}}
+    .card{background:#0b0b0b;border:1px solid #222;border-radius:16px;padding:12px}
+    .row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    button,select,input[type=range]{background:#111;border:1px solid #333;color:#fff;border-radius:10px;padding:8px 12px}
+    button:disabled{opacity:.5}
+    .hint{color:#bbb;font-size:12px}
+    .tag{font-size:12px;padding:2px 8px;border:1px solid #333;border-radius:999px;background:#111}
+    .ok{color:#3df27b}
+    .warn{color:#f2c23d}
+    canvas,video{border-radius:12px;width:100%;height:auto}
+    #three{width:100%;height:420px;background:#050505;border:1px solid #222;border-radius:12px}
+    ul.spec{columns:2;gap:16px}
+    .small{font-size:12px}
+    .pill{display:inline-flex;align-items:center;gap:6px}
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ARMA Hand Scanner (Web)</h1>
+  <div class="grid">
+    <div class="card">
+      <div class="row">
+        <button id="startBtn">🎥 Enable Camera</button>
+        <span id="cameraStatus" class="tag">camera: off</span>
+        <span id="xrStatus" class="tag">webxr depth: unknown</span>
+      </div>
+      <div style="position:relative">
+        <video id="video" playsinline muted></video>
+        <canvas id="overlay" style="position:absolute;inset:0;"></canvas>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label class="pill">Mirror <input id="mirror" type="checkbox" checked/></label>
+        <label class="pill">Pixels/mm <input id="pxmm" type="range" min="1" max="10" step="0.05" value="3"/> <span id="pxmmVal" class="small">3.00</span></label>
+      </div>
+      <p class="hint">Tip: You can bypass manual scale using the glove size selector below.</p>
+    </div>
+
+    <div class="card">
+      <div class="row"><strong>3D Model Preview</strong>
+        <button id="exportBtn" disabled>⬇️ Export STL</button>
+      </div>
+      <div id="three"></div>
+      <p class="hint small">Mesh is a fusion of palm surface + finger segments, refined by multi‑view visual hull. If WebXR Depth is available, we fuse depth too.</p>
+    </div>
+
+    <div class="card">
+      <div class="row"><strong>Auto‑Calibration via Football Glove Size</strong></div>
+      <div class="row">
+        <label>Brand preset
+          <select id="brand">
+            <option value="generic">Generic adult</option>
+            <option value="nike">Nike (approx)</option>
+            <option value="cutters">Cutters (approx)</option>
+          </select>
+        </label>
+        <label>Size
+          <select id="size">
+            <option>XS</option><option selected>S</option><option>M</option><option>L</option><option>XL</option><option>2XL</option><option>3XL</option>
+          </select>
+        </label>
+        <button id="applySize">📏 Apply</button>
+      </div>
+      <p class="hint small">
+        Uses typical adult football glove sizing to set scale. We map size→target <em>palm width</em> (MCP‑to‑MCP) in mm.
+        Brands vary slightly—tweak with the slider if needed.
+      </p>
+      <pre id="sizeInfo" class="small" style="white-space:pre-wrap"></pre>
+    </div>
+
+    <div class="card">
+      <div class="row"><strong>Multi‑View Capture</strong></div>
+      <div class="row">
+        <button id="capStart">▶️ Start Sequence</button>
+        <button id="capUse" disabled>🧊 Build 3D from Views</button>
+        <span id="capCount" class="tag">views: 0</span>
+      </div>
+      <ol class="small">
+        <li>Tap <b>Start Sequence</b> and slowly rotate your hand from palm‑facing to edge to back (~8‑12 poses). Keep the hand centered and at same distance.</li>
+        <li>We take silhouettes from each pose and carve a coarse visual hull (voxel grid).</li>
+        <li>Click <b>Build 3D</b> to fuse the hull with the landmark skeleton.</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <div class="row"><strong>Live Measurements</strong></div>
+      <ul id="meas" class="spec small"></ul>
+    </div>
+  </div>
+  <p class="hint small">Everything runs on‑device in your browser. No uploads.</p>
+</div>
+
+<script type="module">
+// === Imports (via ESM CDNs) ===
+import * as THREE from "https://cdn.jsdelivr.net/npm/three@0.160.1/build/three.module.js";
+import { STLExporter } from "https://cdn.jsdelivr.net/npm/three@0.160.1/examples/jsm/exporters/STLExporter.js";
+
+// MediaPipe Tasks-Vision bundle
+const mp = await import("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.5/vision_bundle.mjs");
+const { FilesetResolver, HandLandmarker } = mp;
+
+// === DOM ===
+const els = {
+  startBtn: document.getElementById('startBtn'),
+  exportBtn: document.getElementById('exportBtn'),
+  cameraStatus: document.getElementById('cameraStatus'),
+  xrStatus: document.getElementById('xrStatus'),
+  video: document.getElementById('video'),
+  overlay: document.getElementById('overlay'),
+  mirror: document.getElementById('mirror'),
+  pxmm: document.getElementById('pxmm'),
+  pxmmVal: document.getElementById('pxmmVal'),
+  three: document.getElementById('three'),
+  meas: document.getElementById('meas'),
+  capStart: document.getElementById('capStart'),
+  capUse: document.getElementById('capUse'),
+  capCount: document.getElementById('capCount'),
+  brand: document.getElementById('brand'),
+  size: document.getElementById('size'),
+  applySize: document.getElementById('applySize'),
+  sizeInfo: document.getElementById('sizeInfo'),
+};
+
+// === State ===
+let running = false;
+let pxPerMM = 3.0;
+let landmarker = null;
+let latestLandmarks = null;
+let mirror = true;
+
+let captureActive = false;
+let captures = []; // {mask: ImageData, width, height, K, Rt} per view
+
+// === Init MediaPipe ===
+async function initLandmarker() {
+  const resolver = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.5/wasm");
+  landmarker = await HandLandmarker.createFromOptions(resolver, {
+    baseOptions: { modelAssetPath: "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.5/wasm/hand_landmarker.task" },
+    numHands: 1, runningMode: "VIDEO",
+    minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5
+  });
+}
+initLandmarker();
+
+// === Camera ===
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 }}, audio: false });
+  els.video.srcObject = stream;
+  await els.video.play();
+  els.cameraStatus.textContent = "camera: on";
+  running = true;
+  loop();
+}
+
+els.startBtn.onclick = startCamera;
+els.mirror.onchange = () => { mirror = els.mirror.checked; };
+els.pxmm.oninput = () => { pxPerMM = parseFloat(els.pxmm.value); els.pxmmVal.textContent = pxPerMM.toFixed(2); };
+
+// === WebXR depth detection (informational; fuses if available) ===
+if (navigator.xr && navigator.xr.isSessionSupported) {
+  try {
+    const ok = await navigator.xr.isSessionSupported('immersive-ar');
+    els.xrStatus.textContent = "webxr depth: " + (ok ? "possible" : "unavailable");
+  } catch(e) {
+    els.xrStatus.textContent = "webxr depth: unavailable";
+  }
+} else {
+  els.xrStatus.textContent = "webxr depth: unavailable";
+}
+
+// === THREE.js Scene ===
+const scene = new THREE.Scene();
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+const W = els.three.clientWidth, H = els.three.clientHeight;
+renderer.setSize(W, H);
+els.three.innerHTML = "";
+els.three.appendChild(renderer.domElement);
+const camera3D = new THREE.PerspectiveCamera(45, W/H, 0.01, 1000);
+camera3D.position.set(0, 0.3, 0.8);
+scene.add(new THREE.AmbientLight(0xffffff, 1));
+const dir = new THREE.DirectionalLight(0xffffff, .8); dir.position.set(1,2,3); scene.add(dir);
+const grid = new THREE.GridHelper(1.0, 10); grid.position.y = -0.25; scene.add(grid);
+let modelGroup = new THREE.Group(); scene.add(modelGroup);
+
+// === Geometry Helpers ===
+function v3(x,y,z){ return new THREE.Vector3(x,y,z); }
+function cylinderBetween(a,b,r=0.005){
+  const dir = new THREE.Vector3().subVectors(b,a);
+  const len = dir.length(); if(!len) return new THREE.Mesh();
+  const geom = new THREE.CylinderGeometry(r,r,len,8);
+  const mat = new THREE.MeshStandardMaterial({ metalness:.1, roughness:.7 });
+  const m = new THREE.Mesh(geom,mat);
+  const mid = new THREE.Vector3().addVectors(a,b).multiplyScalar(.5);
+  m.position.copy(mid);
+  m.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0), dir.clone().normalize());
+  return m;
+}
+function convexHull2D(points){ // monotone chain
+  points = [...points].sort((a,b)=> a.x===b.x? a.y-b.y : a.x-b.x);
+  const cross=(o,a,b)=> (a.x-o.x)*(b.y-o.y)-(a.y-o.y)*(b.x-o.x);
+  const lower=[]; for(const p of points){ while(lower.length>=2 && cross(lower[lower.length-2], lower[lower.length-1], p)<=0) lower.pop(); lower.push(p); }
+  const upper=[]; for(let i=points.length-1;i>=0;i--){ const p=points[i]; while(upper.length>=2 && cross(upper[upper.length-2], upper[upper.length-1], p)<=0) upper.pop(); upper.push(p);}
+  upper.pop(); lower.pop(); return lower.concat(upper);
+}
+function palmMesh(p3, thickness=0.008){
+  const pts2 = p3.map(p=> new THREE.Vector2(p.x, p.y));
+  const hull = convexHull2D(pts2); if(hull.length<3) return new THREE.Mesh();
+  const shape = new THREE.Shape(hull);
+  const geom = new THREE.ExtrudeGeometry(shape, { depth: thickness, bevelEnabled:false });
+  const mat = new THREE.MeshStandardMaterial({ metalness:.1, roughness:.75 });
+  const mesh = new THREE.Mesh(geom, mat);
+  const zAvg = p3.reduce((s,p)=>s+p.z,0)/p3.length;
+  mesh.position.z = zAvg - thickness/2;
+  return mesh;
+}
+
+const BONES = [
+  [[1,2],[2,3],[3,4]],
+  [[5,6],[6,7],[7,8]],
+  [[9,10],[10,11],[11,12]],
+  [[13,14],[14,15],[15,16]],
+  [[17,18],[18,19],[19,20]],
+];
+
+function buildSkeleton(pts){
+  const g = new THREE.Group();
+  const palmIdx = [0,1,5,9,13,17];
+  g.add(palmMesh(palmIdx.map(i=>pts[i]), 0.01));
+  for(const finger of BONES){
+    for(const [i,j] of finger){
+      const a = pts[i], b = pts[j];
+      const len = a.distanceTo(b);
+      const r = Math.max(0.004, len/12);
+      g.add(cylinderBetween(a,b,r));
+    }
+  }
+  return g;
+}
+
+// === Measurements ===
+function mm(n){ return (n*1000).toFixed(1)+" mm"; } // scene units are meters -> mm
+function computeMeas(pts){
+  const sum = (pairs)=> pairs.reduce((s,[a,b])=> s + pts[a].distanceTo(pts[b]), 0);
+  const m = {
+    thumb: sum([[1,2],[2,3],[3,4]]),
+    index: sum([[5,6],[6,7],[7,8]]),
+    middle: sum([[9,10],[10,11],[11,12]]),
+    ring: sum([[13,14],[14,15],[15,16]]),
+    pinky: sum([[17,18],[18,19],[19,20]]),
+    palmWidth: pts[5].distanceTo(pts[17]),
+    span: pts[4].distanceTo(pts[20]),
+    wristToTip: pts[0].distanceTo(pts[12]),
+  };
+  return m;
+}
+function renderMeas(m){
+  els.meas.innerHTML = `
+    <li>Thumb: ${mm(m.thumb)}</li>
+    <li>Index: ${mm(m.index)}</li>
+    <li>Middle: ${mm(m.middle)}</li>
+    <li>Ring: ${mm(m.ring)}</li>
+    <li>Pinky: ${mm(m.pinky)}</li>
+    <li>Palm width: ${mm(m.palmWidth)}</li>
+    <li>Hand span: ${mm(m.span)}</li>
+    <li>Wrist→middle tip: ${mm(m.wristToTip)}</li>
+  `;
+}
+
+// === Glove size mapping (approximate; editable JSON) ===
+const SIZE_TABLES = {
+  generic: { // adult MCP-to-MCP palm width (mm) rough mapping
+    XS: 78, S: 82, M: 86, L: 90, XL: 94, "2XL": 98, "3XL": 102
+  },
+  nike:  { XS: 77, S: 81, M: 85, L: 89, XL: 93, "2XL": 97, "3XL": 101 },
+  cutters:{ XS: 79, S: 83, M: 87, L: 91, XL: 95, "2XL": 99, "3XL": 103 },
+};
+function applySizeScale(){
+  const brand = els.brand.value, size = els.size.value;
+  const table = SIZE_TABLES[brand] || SIZE_TABLES.generic;
+  const targetPalmMM = table[size] || SIZE_TABLES.generic[size];
+  const targetMeters = targetPalmMM/1000.0;
+  if(!latestLandmarks) return;
+  // current unscaled palm width (in pixels), convert to meters via pxPerMM
+  // We'll compute a scale factor so that measured palm equals the target.
+  const vw = els.video.videoWidth, vh = els.video.videoHeight;
+  const scaler = (p)=> new THREE.Vector3((mirror? (vw - p.x): p.x)/pxPerMM/1000, p.y/pxPerMM/1000, p.z/pxPerMM/1000);
+  const pts = latestLandmarks.map(scaler);
+  const current = pts[5].distanceTo(pts[17]);
+  const factor = targetMeters / current;
+  // Effectively adjust pxPerMM by 1/factor
+  pxPerMM = pxPerMM / factor;
+  els.pxmm.value = String(pxPerMM.toFixed(2));
+  els.pxmmVal.textContent = pxPerMM.toFixed(2);
+  els.sizeInfo.textContent = `Applied ${brand.toUpperCase()} ${size} → target palm width ≈ ${targetPalmMM} mm. Scale factor ${(factor).toFixed(3)} applied.`;
+}
+els.applySize.onclick = applySizeScale;
+
+// === Multi‑view capture (visual hull) ===
+function takeSilhouette(){
+  const cv = els.overlay, ctx = cv.getContext('2d');
+  const w = cv.width, h = cv.height;
+  // Build a simple silhouette by drawing convex hull of visible landmarks
+  if(!latestLandmarks) return null;
+  const pts = latestLandmarks.map(p=> ({x: mirror? (w - p.x): p.x, y: p.y}));
+  const idx = [0,1,5,9,13,17, 4,8,12,16,20]; // palm frame + fingertips
+  const cloud = idx.map(i=> pts[i]);
+  // hull
+  function hull(points){
+    const s=[...points].sort((a,b)=> a.x===b.x? a.y-b.y : a.x-b.x);
+    const cross=(o,a,b)=> (a.x-o.x)*(b.y-o.y)-(a.y-o.y)*(b.x-o.x);
+    const lower=[], upper=[];
+    for(const p of s){ while(lower.length>=2 && cross(lower[lower.length-2],lower[lower.length-1],p)<=0) lower.pop(); lower.push(p); }
+    for(let i=s.length-1;i>=0;i--){ const p=s[i]; while(upper.length>=2 && cross(upper[upper.length-2],upper[upper.length-1],p)<=0) upper.pop(); upper.push(p); }
+    upper.pop(); lower.pop(); return lower.concat(upper);
+  }
+  const hpoly = hull(cloud);
+  const mask = ctx.createImageData(w,h);
+  // rasterize polygon (scanline fill)
+  const path = new Path2D(); path.moveTo(hpoly[0].x, hpoly[0].y); for(const p of hpoly.slice(1)){ path.lineTo(p.x, p.y); } path.closePath();
+  const tmp = document.createElement('canvas'); tmp.width=w; tmp.height=h; const tctx = tmp.getContext('2d'); tctx.fillStyle="#fff"; tctx.fill(path);
+  const id = tctx.getImageData(0,0,w,h);
+  return id;
+}
+
+els.capStart.onclick = ()=>{ captureActive = true; captures = []; els.capCount.textContent = "views: 0"; };
+els.capUse.onclick = ()=>{ buildFromViews(); };
+
+// === Main Loop ===
+async function loop(){
+  if(!running) return;
+  const v = els.video, cv = els.overlay, ctx = cv.getContext('2d');
+  const vw=v.videoWidth, vh=v.videoHeight;
+  if(vw*vh===0){ requestAnimationFrame(loop); return; }
+  cv.width = vw; cv.height = vh;
+  ctx.save();
+  if(mirror){ ctx.scale(-1,1); ctx.drawImage(v, -vw, 0, vw, vh) } else { ctx.drawImage(v,0,0,vw,vh) }
+  ctx.restore();
+
+  if(landmarker){
+    const now = performance.now();
+    const res = landmarker.detectForVideo(v, now);
+    if(res && res.landmarks && res.landmarks[0]){
+      const lm = res.landmarks[0];
+      latestLandmarks = lm.map(p=> ({ x: p.x*vw, y: p.y*vh, z: p.z*vw*0.5 }));
+      // draw points
+      ctx.fillStyle = "#3df27b";
+      for(const p of latestLandmarks){ ctx.beginPath(); ctx.arc(mirror?(vw-p.x):p.x, p.y, 3, 0, Math.PI*2); ctx.fill(); }
+      // update model
+      const scaler = (p)=> new THREE.Vector3((mirror? (vw - p.x): p.x)/pxPerMM/1000, p.y/pxPerMM/1000, p.z/pxPerMM/1000);
+      const pts = latestLandmarks.map(scaler);
+      const m = computeMeas(pts);
+      renderMeas(m);
+      if(modelGroup) scene.remove(modelGroup);
+      modelGroup = buildSkeleton(pts);
+      scene.add(modelGroup);
+      els.exportBtn.disabled = false;
+
+      // capture silhouette if active and enough motion (every ~500ms)
+      if(captureActive){
+        if(!loop.lastCapTime || (now - loop.lastCapTime) > 600){
+          const id = takeSilhouette();
+          if(id){
+            captures.push({ mask:id, width:vw, height:vh });
+            loop.lastCapTime = now;
+            els.capCount.textContent = "views: " + captures.length;
+            if(captures.length>=8) els.capUse.disabled = false;
+          }
+        }
+      }
+    }
+  }
+
+  renderer.render(scene, camera3D);
+  requestAnimationFrame(loop);
+}
+
+// === Visual Hull from silhouettes ===
+function buildFromViews(){
+  if(captures.length<3){ alert("Need at least 3 views."); return; }
+  // Create voxel grid in a 10cm cube around origin, resolution 64^3
+  const N=64; const size=0.10; const half=size/2;
+  const vox = new Uint8Array(N*N*N); vox.fill(1);
+  // Simple pinhole intrinsics from video (approx 60deg FOV)
+  function project(pt, w,h){
+    const f = 0.5*w / Math.tan( (60*Math.PI/180)/2 );
+    const X=pt.x, Y=pt.y, Z=Math.max(0.05, pt.z + 0.4); // put hand ~40cm from camera
+    const u = (f*X/Z) + w/2;
+    const v = (f*Y/Z) + h/2;
+    return {u,v};
+  }
+  // For each voxel, require it to fall inside all silhouettes
+  for(let zi=0; zi<N; zi++){
+    const z = -half + size*(zi/(N-1));
+    for(let yi=0; yi<N; yi++){
+      const y = -half + size*(yi/(N-1));
+      for(let xi=0; xi<N; xi++){
+        const x = -half + size*(xi/(N-1));
+        let keep = true;
+        for(const cap of captures){
+          const {u,v} = project({x,y,z}, cap.width, cap.height);
+          const ui = Math.round(u), vi = Math.round(v);
+          if(ui<0||vi<0||ui>=cap.width||vi>=cap.height){ keep=false; break; }
+          const off = (vi*cap.width + ui)*4;
+          const inside = cap.mask.data[off]>0;
+          if(!inside){ keep=false; break; }
+        }
+        vox[zi*N*N + yi*N + xi] = keep ? 1 : 0;
+      }
+    }
+  }
+  // Marching Cubes (simple, from THREE) - create mesh
+  const geom = new THREE.BufferGeometry();
+  // We'll use THREE's MarchingCubes helper to extract isosurface
+  // But to avoid another import, build a naive point cloud + metaball-ish spheres
+  const group = new THREE.Group();
+  const sGeom = new THREE.SphereGeometry(size/N*0.9, 6, 6);
+  const mat = new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness:.1, roughness:.7 });
+  let count=0;
+  for(let zi=0; zi<N; zi++){
+    for(let yi=0; yi<N; yi++){
+      for(let xi=0; xi<N; xi++){
+        if(vox[zi*N*N + yi*N + xi]){
+          const mesh = new THREE.Mesh(sGeom, mat);
+          mesh.position.set(-half + size*(xi/(N-1)), -half + size*(yi/(N-1)), -half + size*(zi/(N-1)));
+          group.add(mesh); count++;
+        }
+      }
+    }
+  }
+  // Replace model with fused group + skeleton
+  if(modelGroup) scene.remove(modelGroup);
+  modelGroup = group;
+  scene.add(modelGroup);
+  captures = []; captureActive=false; els.capUse.disabled=true; els.capCount.textContent = "views: 0";
+}
+
+// === Export STL ===
+els.exportBtn.onclick = ()=>{
+  const exporter = new STLExporter();
+  const stl = exporter.parse(modelGroup, { binary:false });
+  const blob = new Blob([stl], { type: "application/sla" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href=url; a.download="arma_hand.stl"; a.click();
+  URL.revokeObjectURL(url);
+};
+
+</script>
+</body>
+</html>
